@@ -21,6 +21,7 @@ private:
     std::atomic<bool>                isRunning { false };
     std::string                      serverRootPath;
     int                              currentPort = 0;
+    std::chrono::steady_clock::time_point serverStartedAt {};
 
     std::mutex               eventMutex;
     std::vector<UploadEvent> pendingEvents;
@@ -517,14 +518,6 @@ private:
                         is_target_file = false;
                         has_error = true;
                         errstr = "invalid filename";
-                        return false;
-                    }
-
-                    auto validation = ValidateUpload(final_filename, expected_size, route);
-                    if (!validation.ok && expected_size > 0) {
-                        is_target_file = false;
-                        has_error = true;
-                        errstr = validation.reason;
                         return false;
                     }
 
@@ -1151,7 +1144,7 @@ private:
             }
             host = host.substr(0, portPos);
         } else {
-            port = (scheme == "https") ? 443 : 80;
+            port = (scheme == "https" || scheme == "wss") ? 443 : 80;
         }
 
         return !host.empty();
@@ -1686,9 +1679,10 @@ private:
             
             // Escape regex special chars
             char c = endpoint[i];
-            if (c == '.' || c == '+' || c == '*' || c == '?' || 
+            if (c == '.' || c == '+' || c == '*' || c == '?' ||
                 c == '^' || c == '$' || c == '(' || c == ')' ||
-                c == '[' || c == ']' || c == '|' || c == '\\') {
+                c == '[' || c == ']' || c == '|' || c == '\\' ||
+                c == '{' || c == '}') {
                 pattern += '\\';
             }
             pattern += c;
@@ -1729,7 +1723,11 @@ private:
         return result;
     }
 
-    APIRoute* MatchApiRoute(HttpMethod method, const std::string& path, std::unordered_map<std::string, std::string>& params)
+    bool MatchApiRoute(
+        HttpMethod method,
+        const std::string& path,
+        APIRoute& matchedRoute,
+        std::unordered_map<std::string, std::string>& params)
     {
         std::lock_guard<std::mutex> lock(apiRoutesMutex);
         
@@ -1743,10 +1741,11 @@ private:
                 for (size_t i = 0; i < route.paramNames.size() && i + 1 < match.size(); ++i) {
                     params[route.paramNames[i]] = match[i + 1].str();
                 }
-                return &route;
+                matchedRoute = route;
+                return true;
             }
         }
-        return nullptr;
+        return false;
     }
 
     bool CheckApiAuth(const APIRoute& route, const httplib::Request& req)
@@ -1811,12 +1810,13 @@ private:
     {
         std::string path = req.path;
         std::unordered_map<std::string, std::string> urlParams;
+        APIRoute route;
         
-        APIRoute* route = MatchApiRoute(method, path, urlParams);
-        if (!route && method == HttpMethod::HEAD) {
-            route = MatchApiRoute(HttpMethod::GET, path, urlParams);
+        bool hasRoute = MatchApiRoute(method, path, route, urlParams);
+        if (!hasRoute && method == HttpMethod::HEAD) {
+            hasRoute = MatchApiRoute(HttpMethod::GET, path, route, urlParams);
         }
-        if (!route) {
+        if (!hasRoute) {
             res.status = 404;
             res.set_content(Json::Obj({
                 Json::Bool("success", false),
@@ -1825,7 +1825,7 @@ private:
             return;
         }
         
-        if (!CheckApiAuth(*route, req)) {
+        if (!CheckApiAuth(route, req)) {
             res.status = 401;
             res.set_content(Json::Obj({
                 Json::Bool("success", false),
@@ -1847,14 +1847,14 @@ private:
             std::lock_guard<std::mutex> lock(apiEventMutex);
             pendingApiEvents.push_back({
                 ctx->requestId,
-                route->routeId,
-                route->callbackName
+                route.routeId,
+                route.callbackName
             });
         }
         
         // Wait for response (with timeout)
         auto start = std::chrono::steady_clock::now();
-        while (!ctx->responded) {
+        while (!ctx->responded.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             auto elapsed = std::chrono::steady_clock::now() - start;
             if (elapsed > std::chrono::seconds(30)) {
@@ -1960,14 +1960,18 @@ private:
         
         // Built-in endpoints
         httpServer->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+            long long uptimeSec = 0;
+            if (isRunning && serverStartedAt.time_since_epoch().count() != 0) {
+                uptimeSec = static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - serverStartedAt
+                    ).count()
+                );
+            }
             res.set_content(Json::Obj({
                 Json::Bool("success", true),
                 Json::Str("status", "healthy"),
-                Json::Num("uptime", static_cast<long long>(
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()
-                    ).count()
-                ), false)
+                Json::Num("uptime", uptimeSec, false)
             }), "application/json");
         });
         
@@ -2014,7 +2018,9 @@ private:
         // GET {endpoint}/files/{filename} - Download file
         httpServer->Get((endpoint + "/files/(.+)").c_str(),
             [this, capturedId](const httplib::Request& req, httplib::Response& res) {
-                if (req.path.find("/info") != std::string::npos) return; // Skip if /info
+                constexpr size_t infoSuffixLen = sizeof("/info") - 1;
+                if (req.path.size() >= infoSuffixLen &&
+                    req.path.compare(req.path.size() - infoSuffixLen, infoSuffixLen, "/info") == 0) return; // Skip only if /info suffix
                 HandleFileDownload(req, res, capturedId);
             });
         
@@ -2095,6 +2101,14 @@ private:
                 while ((entry = readdir(dir)) != nullptr) {
                     if (entry->d_type == DT_REG) {
                         files.push_back(entry->d_name);
+                    } else if (entry->d_type == DT_UNKNOWN) {
+                        std::string fullPath = destPath;
+                        if (!fullPath.empty() && fullPath.back() != '/') fullPath += '/';
+                        fullPath += entry->d_name;
+                        struct stat st;
+                        if (stat(fullPath.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                            files.push_back(entry->d_name);
+                        }
                     }
                 }
                 closedir(dir);
@@ -2403,6 +2417,7 @@ private:
 
         currentPort = port;
         isRunning = true;
+        serverStartedAt = std::chrono::steady_clock::now();
 
         httpThread = std::thread([this]() {
             httpServer->listen_after_bind();
@@ -2428,6 +2443,7 @@ private:
         }
         isRunning = false;
         currentPort = 0;
+        serverStartedAt = std::chrono::steady_clock::time_point{};
         tlsEnabled = false;
         tlsCertPath.clear();
         tlsKeyPath.clear();
@@ -2764,9 +2780,13 @@ public:
         route.callbackName = callback;
         route.requireAuth = false;
         
-        auto compiled = CompileEndpointPattern(endpoint);
-        route.pattern = compiled.first;
-        route.paramNames = compiled.second;
+        try {
+            auto compiled = CompileEndpointPattern(endpoint);
+            route.pattern = compiled.first;
+            route.paramNames = compiled.second;
+        } catch (const std::regex_error&) {
+            return -1;
+        }
         
         int id = route.routeId;
         
@@ -2931,6 +2951,14 @@ public:
                 while ((entry = readdir(dir)) != nullptr) {
                     if (entry->d_type == DT_REG) {
                         ++count;
+                    } else if (entry->d_type == DT_UNKNOWN) {
+                        std::string fullPath = destPath;
+                        if (!fullPath.empty() && fullPath.back() != '/') fullPath += '/';
+                        fullPath += entry->d_name;
+                        struct stat st;
+                        if (stat(fullPath.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                            ++count;
+                        }
                     }
                 }
                 closedir(dir);
@@ -2973,7 +3001,19 @@ public:
             if (dir) {
                 struct dirent* entry;
                 while ((entry = readdir(dir)) != nullptr) {
+                    bool isRegular = false;
                     if (entry->d_type == DT_REG) {
+                        isRegular = true;
+                    } else if (entry->d_type == DT_UNKNOWN) {
+                        std::string fullPath = destPath;
+                        if (!fullPath.empty() && fullPath.back() != '/') fullPath += '/';
+                        fullPath += entry->d_name;
+                        struct stat st;
+                        if (stat(fullPath.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                            isRegular = true;
+                        }
+                    }
+                    if (isRegular) {
                         if (count == index) {
                             result = entry->d_name;
                             break;
@@ -3458,7 +3498,7 @@ public:
     bool Respond(int requestId, int status, const std::string& body, const std::string& contentType)
     {
         auto ctx = GetRequest(requestId);
-        if (!ctx || ctx->responded || !ctx->httpRes) return false;
+        if (!ctx || ctx->responded.load(std::memory_order_acquire) || !ctx->httpRes) return false;
         
         for (const auto& kv : ctx->responseHeaders) {
             ctx->httpRes->set_header(kv.first.c_str(), kv.second.c_str());
@@ -3466,7 +3506,7 @@ public:
         
         ctx->httpRes->status = status;
         ctx->httpRes->set_content(body, contentType.c_str());
-        ctx->responded = true;
+        ctx->responded.store(true, std::memory_order_release);
         return true;
     }
     
@@ -3486,7 +3526,7 @@ public:
     bool SetResponseHeader(int requestId, const std::string& name, const std::string& value)
     {
         auto ctx = GetRequest(requestId);
-        if (!ctx || ctx->responded) return false;
+        if (!ctx || ctx->responded.load(std::memory_order_acquire)) return false;
         ctx->responseHeaders[name] = value;
         return true;
     }

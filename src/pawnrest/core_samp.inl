@@ -68,8 +68,28 @@ private:
     
     std::mutex apiEventMutex;
     std::vector<APIRequestEvent> pendingApiEvents;
+    void (*logSink)(const char*) = nullptr;
 
 private:
+    template <typename... Args>
+    void PrintLn(const char* fmt, Args... args)
+    {
+        if (!logSink || !fmt) return;
+        char buffer[1024];
+        int written = 0;
+        if constexpr (sizeof...(Args) == 0) {
+            written = std::snprintf(buffer, sizeof(buffer), "%s", fmt);
+        } else {
+            written = std::snprintf(buffer, sizeof(buffer), fmt, args...);
+        }
+        if (written < 0) return;
+        buffer[sizeof(buffer) - 1] = '\0';
+        logSink(buffer);
+        if (written >= static_cast<int>(sizeof(buffer))) {
+            logSink("[PawnREST] WARNING: log message truncated");
+        }
+    }
+
     std::string MakeTempPath(int uploadId)
     {
         auto ts = std::chrono::system_clock::now().time_since_epoch().count();
@@ -1669,7 +1689,7 @@ private:
         
         // Wait for response (with timeout)
         auto start = std::chrono::steady_clock::now();
-        while (!ctx->responded) {
+        while (!ctx->responded.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             auto elapsed = std::chrono::steady_clock::now() - start;
             if (elapsed > std::chrono::seconds(30)) {
@@ -2105,6 +2125,7 @@ private:
         const std::string& keyPath = "")
     {
         if (isRunning) {
+            PrintLn("[PawnREST] ERROR: Server already running on port %d", currentPort);
             return false;
         }
 
@@ -2133,14 +2154,17 @@ private:
             std::string certFullPath = resolvePath(certPath);
             std::string keyFullPath = resolvePath(keyPath);
             if (certFullPath.empty() || keyFullPath.empty()) {
+                PrintLn("[PawnREST] ERROR: TLS requires valid cert and key paths");
                 return false;
             }
             if (!FileUtils::FileExists(certFullPath) || !FileUtils::FileExists(keyFullPath)) {
+                PrintLn("[PawnREST] ERROR: TLS cert/key file not found");
                 return false;
             }
 
             auto sslServer = std::make_unique<httplib::SSLServer>(certFullPath.c_str(), keyFullPath.c_str());
             if (!sslServer->is_valid()) {
+                PrintLn("[PawnREST] ERROR: Failed to initialize HTTPS server with provided cert/key");
                 return false;
             }
             httpServer = std::move(sslServer);
@@ -2148,6 +2172,7 @@ private:
             tlsCertPath = certFullPath;
             tlsKeyPath = keyFullPath;
 #else
+            PrintLn("[PawnREST] ERROR: TLS/HTTPS is not available in this build");
             return false;
 #endif
         } else {
@@ -2186,6 +2211,7 @@ private:
         SetupApiHandlers();
 
         if (!httpServer->bind_to_port("0.0.0.0", port)) {
+            PrintLn("[PawnREST] ERROR: Port %d is already in use. Please use a different port.", port);
             httpServer.reset();
             tlsEnabled = false;
             tlsCertPath.clear();
@@ -2200,6 +2226,7 @@ private:
             httpServer->listen_after_bind();
         });
 
+        PrintLn("  [PawnREST] %s server started on port %d", tlsEnabled ? "HTTPS" : "HTTP", port);
         return true;
     }
 
@@ -2226,6 +2253,11 @@ public:
 
 public:
     PawnRESTCore() = default;
+
+    void SetLogger(void (*sink)(const char*))
+    {
+        logSink = sink;
+    }
 
     void Initialize()
     {
@@ -2295,6 +2327,7 @@ public:
         if (!isRunning) return false;
         bool wasTls = tlsEnabled;
         StopHttpServer();
+        PrintLn("  [PawnREST] %s server stopped", wasTls ? "HTTPS" : "HTTP");
         return true;
     }
     bool IsRunning() const { return isRunning; }
@@ -2350,6 +2383,7 @@ public:
             RegisterFileOpsForRoute(id, capturedEndpoint);
         }
 
+        PrintLn("  Files: POST %s -> %s", capturedEndpoint.c_str(), safePath.c_str());
         return id;
     }
 
@@ -2508,6 +2542,7 @@ public:
         }
         
         const char* methodNames[] = { "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS" };
+        PrintLn("  API: %s %s -> %s()", methodNames[method], endpoint.c_str(), callback.c_str());
         return id;
     }
     
@@ -3125,7 +3160,7 @@ public:
     bool Respond(int requestId, int status, const std::string& body, const std::string& contentType)
     {
         auto ctx = GetRequest(requestId);
-        if (!ctx || ctx->responded || !ctx->httpRes) return false;
+        if (!ctx || ctx->responded.load(std::memory_order_acquire) || !ctx->httpRes) return false;
         
         for (const auto& kv : ctx->responseHeaders) {
             ctx->httpRes->set_header(kv.first.c_str(), kv.second.c_str());
@@ -3133,7 +3168,7 @@ public:
         
         ctx->httpRes->status = status;
         ctx->httpRes->set_content(body, contentType.c_str());
-        ctx->responded = true;
+        ctx->responded.store(true, std::memory_order_release);
         return true;
     }
     
@@ -3153,7 +3188,7 @@ public:
     bool SetResponseHeader(int requestId, const std::string& name, const std::string& value)
     {
         auto ctx = GetRequest(requestId);
-        if (!ctx || ctx->responded) return false;
+        if (!ctx || ctx->responded.load(std::memory_order_acquire)) return false;
         ctx->responseHeaders[name] = value;
         return true;
     }
@@ -3324,6 +3359,7 @@ public:
 
         std::string fullPath = serverRootPath + safeFile;
         if (!FileUtils::FileExists(fullPath)) {
+            PrintLn("[PawnREST] Upload failed: file not found %s", fullPath.c_str());
             return -1;
         }
 
@@ -3347,6 +3383,8 @@ public:
             outgoingUploads[id] = std::move(upload);
         }
 
+        PrintLn("[PawnREST] Upload queued #%d: %s -> %s (%s)",
+            id, filepath.c_str(), url.c_str(), (mode == 1 ? "RAW" : "MULTIPART"));
         return id;
     }
 
@@ -3370,6 +3408,7 @@ public:
             std::lock_guard<std::mutex> lock(outgoingMutex);
             uploadClients[id] = std::move(client);
         }
+        PrintLn("[PawnREST] Upload client #%d created: %s", id, baseUrl.c_str());
         return id;
     }
 

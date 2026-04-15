@@ -296,7 +296,7 @@ struct RequestContext {
     std::unordered_map<std::string, std::string> responseHeaders;
     
     // State
-    bool                 responded = false;
+    std::atomic<bool>    responded { false };
     httplib::Response*   httpRes = nullptr;
 };
 

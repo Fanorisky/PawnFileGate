@@ -13,6 +13,9 @@ env:
   LINUX_DOCKER_IMAGE: pawnrest/build:ubuntu-22.04-static-ssl
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: verify the Pawn public API compiles before running heavy builds
+  # ---------------------------------------------------------------------------
   pawn-api-smoke:
     name: Verify Pawn API
     runs-on: ubuntu-latest
@@ -26,7 +29,11 @@ jobs:
       - name: Build Pawn compiler
         run: |
           set -eux
-          cmake -S deps/pawn/source/compiler -B build-pawncc -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_C_STANDARD=11
+          cmake -S deps/pawn/source/compiler -B build-pawncc \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_C_STANDARD=11
           cmake --build build-pawncc --target pawncc --parallel
 
       - name: Compile PawnREST smoke script
@@ -37,10 +44,14 @@ jobs:
             "-i${GITHUB_WORKSPACE}/deps/pawn/include" \
             "${GITHUB_WORKSPACE}/ci/pawnrest_smoke_test.pwn"
 
+  # ---------------------------------------------------------------------------
+  # Linux 32-bit builds (4 variants)
+  # ---------------------------------------------------------------------------
   linux:
     name: Build Linux 32-bit (${{ matrix.target }}, ${{ matrix.linkage }})
     runs-on: ubuntu-latest
     needs: pawn-api-smoke
+
     strategy:
       fail-fast: false
       matrix:
@@ -83,10 +94,33 @@ jobs:
             exit 1
           }
 
-      - name: Build Linux toolchain image
+      # Cache the Docker image layers so we don't rebuild the toolchain every run.
+      # The cache key is tied to the Dockerfile content — it only rebuilds when
+      # the Dockerfile actually changes.
+      - name: Cache Docker image layers
+        uses: actions/cache@v4
+        id: docker-cache
+        with:
+          path: /tmp/docker-cache
+          key: docker-${{ env.LINUX_DOCKER_IMAGE }}-${{ hashFiles('docker/build_ubuntu-22.04-static-ssl/Dockerfile') }}
+          restore-keys: |
+            docker-${{ env.LINUX_DOCKER_IMAGE }}-
+
+      - name: Load cached Docker image (if available)
+        if: steps.docker-cache.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/docker-cache/image.tar
+
+      - name: Build Linux toolchain image (if not cached)
+        if: steps.docker-cache.outputs.cache-hit != 'true'
         run: |
           set -eux
           docker build -t "${LINUX_DOCKER_IMAGE}" docker/build_ubuntu-22.04-static-ssl
+
+      - name: Save Docker image to cache
+        if: steps.docker-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/docker-cache
+          docker save "${LINUX_DOCKER_IMAGE}" -o /tmp/docker-cache/image.tar
 
       - name: Prepare writable build directory
         run: |
@@ -132,10 +166,14 @@ jobs:
             dist/${{ matrix.artifact_name }}/PawnREST.inc
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Windows 32-bit builds (4 variants)
+  # ---------------------------------------------------------------------------
   windows:
     name: Build Windows 32-bit (${{ matrix.target }}, ${{ matrix.linkage }})
     runs-on: windows-latest
     needs: pawn-api-smoke
+
     strategy:
       fail-fast: false
       matrix:
@@ -172,48 +210,97 @@ jobs:
           submodules: recursive
 
       - name: Verify SA-MP SDK availability
+        shell: powershell
         run: |
           if (-not (Test-Path "deps/samp-plugin-sdk/plugincommon.h")) {
             throw "deps/samp-plugin-sdk is missing. Commit it or vendor it before running CI."
           }
-        shell: powershell
 
-      - name: Bootstrap vcpkg and install OpenSSL
+      # ---------------------------------------------------------------------------
+      # sccache: compiler output cache — drastically speeds up repeat builds.
+      # The action installs sccache and sets SCCACHE_GHA_ENABLED so the binary
+      # cache backend (GitHub Actions cache) is used automatically.
+      # ---------------------------------------------------------------------------
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.5
+
+      # ---------------------------------------------------------------------------
+      # vcpkg bootstrap
+      # We clone vcpkg once per job. The installed packages are cached separately
+      # per triplet so each variant only rebuilds when CMakeLists.txt changes.
+      # ---------------------------------------------------------------------------
+      - name: Bootstrap vcpkg
+        shell: powershell
         run: |
           git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
           & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
-          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install "openssl:${{ matrix.vcpkg_triplet }}"
-        shell: powershell
 
-      - name: Configure CMake for 32-bit
+      # Cache the compiled vcpkg packages.
+      # Key includes the triplet and a hash of CMakeLists.txt so the cache
+      # is invalidated only when dependencies or the build definition change.
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        id: vcpkg-cache
+        with:
+          path: ${{ env.RUNNER_TEMP }}\vcpkg\installed
+          key: vcpkg-${{ runner.os }}-${{ matrix.vcpkg_triplet }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ matrix.vcpkg_triplet }}-
+
+      - name: Install OpenSSL via vcpkg
+        shell: powershell
         run: |
-          cmake -S . -B build-${{ matrix.target }}-${{ matrix.linkage }} -G "Visual Studio 17 2022" -A Win32 `
+          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install "openssl:${{ matrix.vcpkg_triplet }}"
+
+      # ---------------------------------------------------------------------------
+      # CMake configure — 32-bit Visual Studio 2022 with sccache as compiler
+      # launcher so incremental / repeated builds hit the cache.
+      # ---------------------------------------------------------------------------
+      - name: Configure CMake for 32-bit
+        shell: powershell
+        run: |
+          cmake -S . -B build-${{ matrix.target }}-${{ matrix.linkage }} `
+            -G "Visual Studio 17 2022" -A Win32 `
             -DCMAKE_BUILD_TYPE=${{ env.CONFIG }} `
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
             -DCMAKE_TOOLCHAIN_FILE="$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }} `
             -DBUILD_SAMP_PLUGIN=${{ matrix.build_samp_plugin }} `
             -DPAWNREST_ENABLE_TLS=ON `
-            -DPAWNREST_TLS_STATIC_OPENSSL=${{ matrix.tls_static }}
-        shell: powershell
+            -DPAWNREST_TLS_STATIC_OPENSSL=${{ matrix.tls_static }} `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Build PawnREST.dll
-        run: |
-          cmake --build build-${{ matrix.target }}-${{ matrix.linkage }} --config ${{ env.CONFIG }} --parallel
         shell: powershell
+        run: |
+          cmake --build build-${{ matrix.target }}-${{ matrix.linkage }} `
+            --config ${{ env.CONFIG }} `
+            --parallel
 
+      # ---------------------------------------------------------------------------
+      # Package: find the plugin DLL and copy only plugin payload (.dll + .inc)
+      # Runtime OpenSSL DLLs (dynamic linkage) are packaged separately below so
+      # plugin size comparisons stay apples-to-apples with static linkage.
+      # ---------------------------------------------------------------------------
       - name: Verify and package Windows artifact
+        shell: powershell
         run: |
           $artifactRoot = Join-Path $PWD "dist/${{ matrix.artifact_name }}"
           New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 
-          $dllPath = Get-ChildItem -Path "build-${{ matrix.target }}-${{ matrix.linkage }}" -Filter "PawnREST.dll" -Recurse | Select-Object -First 1
+          $dllPath = Get-ChildItem `
+            -Path "build-${{ matrix.target }}-${{ matrix.linkage }}" `
+            -Filter "PawnREST.dll" `
+            -Recurse |
+            Select-Object -First 1
+
           if (-not $dllPath) {
             throw "PawnREST.dll not found for ${{ matrix.target }} (${{ matrix.linkage }})"
           }
 
           Copy-Item $dllPath.FullName -Destination (Join-Path $artifactRoot "PawnREST.dll") -Force
-          Copy-Item "PawnREST.inc" -Destination (Join-Path $artifactRoot "PawnREST.inc") -Force
+          Copy-Item "PawnREST.inc"    -Destination (Join-Path $artifactRoot "PawnREST.inc")  -Force
 
           if ("${{ matrix.linkage }}" -eq "dynamic") {
             $opensslBin = Join-Path $env:RUNNER_TEMP "vcpkg\installed\${{ matrix.vcpkg_triplet }}\bin"
@@ -221,17 +308,17 @@ jobs:
               throw "OpenSSL runtime directory not found: $opensslBin"
             }
 
-            $runtimeDlls = Get-ChildItem -Path $opensslBin -Filter "*.dll" | Where-Object {
-              $_.Name -match '^lib(ssl|crypto).*\.dll$'
-            }
+            $runtimeDlls = Get-ChildItem -Path $opensslBin -Filter "*.dll" |
+              Where-Object { $_.Name -match '^lib(ssl|crypto).*\.dll$' }
 
             if (-not $runtimeDlls) {
-              throw "Expected OpenSSL runtime DLLs were not found in $opensslBin"
+              throw "Expected OpenSSL runtime DLLs not found in $opensslBin"
             }
 
-            Copy-Item $runtimeDlls.FullName -Destination $artifactRoot -Force
+            $runtimeRoot = Join-Path $PWD "dist/${{ matrix.artifact_name }}-runtime"
+            New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+            Copy-Item $runtimeDlls.FullName -Destination $runtimeRoot -Force
           }
-        shell: powershell
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -240,6 +327,14 @@ jobs:
           path: |
             dist/${{ matrix.artifact_name }}/PawnREST.dll
             dist/${{ matrix.artifact_name }}/PawnREST.inc
-            dist/${{ matrix.artifact_name }}/libssl-*.dll
-            dist/${{ matrix.artifact_name }}/libcrypto-*.dll
+          if-no-files-found: error
+
+      - name: Upload Windows runtime artifact (dynamic only)
+        if: matrix.linkage == 'dynamic'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-runtime
+          path: |
+            dist/${{ matrix.artifact_name }}-runtime/libssl-*.dll
+            dist/${{ matrix.artifact_name }}-runtime/libcrypto-*.dll
           if-no-files-found: error

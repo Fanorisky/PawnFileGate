@@ -1,5 +1,1 @@
-#include "pawnrest/preamble.inl"
-#include "pawnrest/json.inl"
-#include "pawnrest/utils.inl"
-#include "pawnrest/component.inl"
-#include "pawnrest/entry_natives.inl"
+#include "pawnrest/entry_shared.inl"

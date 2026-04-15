@@ -227,6 +227,7 @@ namespace Json {
         
         while (pos < json.size()) {
             SkipWhitespace(json, pos);
+            if (pos >= json.size()) return false;
             if (json[pos] == '}') return false;
             
             std::string k;
@@ -356,6 +357,7 @@ namespace Json {
         if (pos >= json.size() || json[pos] != '[') return -1;
         ++pos;
         SkipWhitespace(json, pos);
+        if (pos >= json.size()) return -1;
         if (json[pos] == ']') return 0;
         
         int count = 0;
@@ -643,4 +645,3 @@ namespace Json {
         return "null";
     }
 }
-

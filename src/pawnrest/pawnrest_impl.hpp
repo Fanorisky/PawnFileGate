@@ -32,10 +32,10 @@
 #include "types.inl"
 #include "json.inl"
 #include "utils.inl"
+#include <crc32.hpp>
 #include "core_samp.inl"
 
 #include <climits>
-#include <crc32.hpp>
 
 namespace PawnREST {
     inline PawnRESTCore& GetCore() {
@@ -56,6 +56,10 @@ inline void ImplShutdown() {
     if (!PawnREST::g_Initialized) return;
     PawnREST::GetCore().Shutdown();
     PawnREST::g_Initialized = false;
+}
+
+inline void ImplSetLogger(void (*sink)(const char*)) {
+    PawnREST::GetCore().SetLogger(sink);
 }
 
 // -----------------------------------------------------------------------------

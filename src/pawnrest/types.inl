@@ -260,7 +260,7 @@ struct RequestContext {
     std::vector<std::string> jsonStack;
     bool                 jsonStarted = false;
     std::unordered_map<std::string, std::string> responseHeaders;
-    bool                 responded = false;
+    std::atomic<bool>    responded { false };
     httplib::Response*   httpRes = nullptr;
 };
 

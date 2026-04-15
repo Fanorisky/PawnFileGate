@@ -21,17 +21,23 @@ extern void* pAMXFunctions;
 typedef void (*logprintf_t)(const char* format, ...);
 logprintf_t logprintf;
 
-// Shared implementation
-#include "pawnrest/pawnrest_impl.hpp"
+static void PawnRestLogSink(const char* message) {
+    if (logprintf && message) {
+        logprintf("%s", message);
+    }
+}
+
+// Shared entry include (used by both SA-MP and open.mp builds)
+#include "pawnrest/entry_shared.inl"
 
 // AMX list for callbacks
 static std::vector<AMX*> g_AmxList;
 static std::mutex g_AmxListMutex;
 static std::chrono::steady_clock::time_point g_LastDrainTime;
 
-static AMX* GetFirstAMX() {
+static std::vector<AMX*> GetLoadedAMXSnapshot() {
     std::lock_guard<std::mutex> lock(g_AmxListMutex);
-    return g_AmxList.empty() ? nullptr : g_AmxList.front();
+    return g_AmxList;
 }
 
 // AMX string helpers
@@ -948,17 +954,18 @@ static const AMX_NATIVE_INFO PluginNatives[] = {
 // -----------------------------------------------------------------------------
 
 static void DrainAllEvents() {
-    AMX* amx = GetFirstAMX();
-    if (!amx) return;
-
-    int idx = -1;
+    auto amxList = GetLoadedAMXSnapshot();
+    if (amxList.empty()) return;
 
     // API route callbacks: callback(requestId)
     auto apiEvents = ImplDrainApiEvents();
     for (const auto& evt : apiEvents) {
-        if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
-            amx_Push(amx, evt.requestId);
-            amx_Exec(amx, nullptr, idx);
+        for (AMX* amx : amxList) {
+            int idx = -1;
+            if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
+                amx_Push(amx, evt.requestId);
+                amx_Exec(amx, nullptr, idx);
+            }
         }
     }
 
@@ -967,39 +974,48 @@ static void DrainAllEvents() {
     for (const auto& evt : incomingUploadEvents) {
         switch (evt.type) {
             case UploadEvent::Type::Completed:
-                if (amx_FindPublic(amx, "OnIncomingUploadCompleted", &idx) == AMX_ERR_NONE) {
-                    std::string crcHex = CRC32::toHex(evt.crc32Checksum);
-                    cell strAddr[4];
-                    amx_Push(amx, evt.crc32Matched ? 1 : 0);
-                    amx_PushString(amx, &strAddr[3], nullptr, crcHex.c_str(), 0, 0);
-                    amx_PushString(amx, &strAddr[2], nullptr, evt.filepath.c_str(), 0, 0);
-                    amx_PushString(amx, &strAddr[1], nullptr, evt.filename.c_str(), 0, 0);
-                    amx_PushString(amx, &strAddr[0], nullptr, evt.endpoint.c_str(), 0, 0);
-                    amx_Push(amx, evt.routeId);
-                    amx_Push(amx, evt.uploadId);
-                    amx_Exec(amx, nullptr, idx);
-                    for (int i = 0; i < 4; ++i) amx_Release(amx, strAddr[i]);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, "OnIncomingUploadCompleted", &idx) == AMX_ERR_NONE) {
+                        std::string crcHex = CRC32::toHex(evt.crc32Checksum);
+                        cell strAddr[4];
+                        amx_Push(amx, evt.crc32Matched ? 1 : 0);
+                        amx_PushString(amx, &strAddr[3], nullptr, crcHex.c_str(), 0, 0);
+                        amx_PushString(amx, &strAddr[2], nullptr, evt.filepath.c_str(), 0, 0);
+                        amx_PushString(amx, &strAddr[1], nullptr, evt.filename.c_str(), 0, 0);
+                        amx_PushString(amx, &strAddr[0], nullptr, evt.endpoint.c_str(), 0, 0);
+                        amx_Push(amx, evt.routeId);
+                        amx_Push(amx, evt.uploadId);
+                        amx_Exec(amx, nullptr, idx);
+                        for (int i = 0; i < 4; ++i) amx_Release(amx, strAddr[i]);
+                    }
                 }
                 break;
 
             case UploadEvent::Type::Failed:
-                if (amx_FindPublic(amx, "OnIncomingUploadFailed", &idx) == AMX_ERR_NONE) {
-                    std::string crcHex = CRC32::toHex(evt.crc32Checksum);
-                    cell strAddr[2];
-                    amx_PushString(amx, &strAddr[1], nullptr, crcHex.c_str(), 0, 0);
-                    amx_PushString(amx, &strAddr[0], nullptr, evt.reason.c_str(), 0, 0);
-                    amx_Push(amx, evt.uploadId);
-                    amx_Exec(amx, nullptr, idx);
-                    amx_Release(amx, strAddr[0]);
-                    amx_Release(amx, strAddr[1]);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, "OnIncomingUploadFailed", &idx) == AMX_ERR_NONE) {
+                        std::string crcHex = CRC32::toHex(evt.crc32Checksum);
+                        cell strAddr[2];
+                        amx_PushString(amx, &strAddr[1], nullptr, crcHex.c_str(), 0, 0);
+                        amx_PushString(amx, &strAddr[0], nullptr, evt.reason.c_str(), 0, 0);
+                        amx_Push(amx, evt.uploadId);
+                        amx_Exec(amx, nullptr, idx);
+                        amx_Release(amx, strAddr[0]);
+                        amx_Release(amx, strAddr[1]);
+                    }
                 }
                 break;
 
             case UploadEvent::Type::Progress:
-                if (amx_FindPublic(amx, "OnIncomingUploadProgress", &idx) == AMX_ERR_NONE) {
-                    amx_Push(amx, evt.progressPct);
-                    amx_Push(amx, evt.uploadId);
-                    amx_Exec(amx, nullptr, idx);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, "OnIncomingUploadProgress", &idx) == AMX_ERR_NONE) {
+                        amx_Push(amx, evt.progressPct);
+                        amx_Push(amx, evt.uploadId);
+                        amx_Exec(amx, nullptr, idx);
+                    }
                 }
                 break;
         }
@@ -1010,45 +1026,57 @@ static void DrainAllEvents() {
     for (const auto& evt : outgoingUploadEvents) {
         switch (evt.type) {
             case OutgoingUploadEvent::Type::Started:
-                if (amx_FindPublic(amx, "OnOutgoingUploadStarted", &idx) == AMX_ERR_NONE) {
-                    amx_Push(amx, evt.uploadId);
-                    amx_Exec(amx, nullptr, idx);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, "OnOutgoingUploadStarted", &idx) == AMX_ERR_NONE) {
+                        amx_Push(amx, evt.uploadId);
+                        amx_Exec(amx, nullptr, idx);
+                    }
                 }
                 break;
 
             case OutgoingUploadEvent::Type::Progress:
-                if (amx_FindPublic(amx, "OnOutgoingUploadProgress", &idx) == AMX_ERR_NONE) {
-                    amx_Push(amx, evt.progressPct);
-                    amx_Push(amx, evt.uploadId);
-                    amx_Exec(amx, nullptr, idx);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, "OnOutgoingUploadProgress", &idx) == AMX_ERR_NONE) {
+                        amx_Push(amx, evt.progressPct);
+                        amx_Push(amx, evt.uploadId);
+                        amx_Exec(amx, nullptr, idx);
+                    }
                 }
                 break;
 
             case OutgoingUploadEvent::Type::Completed:
-                if (amx_FindPublic(amx, "OnOutgoingUploadCompleted", &idx) == AMX_ERR_NONE) {
-                    std::string crcHex = CRC32::toHex(evt.crc32Checksum);
-                    cell strAddr[2];
-                    amx_PushString(amx, &strAddr[1], nullptr, crcHex.c_str(), 0, 0);
-                    amx_PushString(amx, &strAddr[0], nullptr, evt.responseBody.c_str(), 0, 0);
-                    amx_Push(amx, evt.httpStatus);
-                    amx_Push(amx, evt.uploadId);
-                    amx_Exec(amx, nullptr, idx);
-                    amx_Release(amx, strAddr[0]);
-                    amx_Release(amx, strAddr[1]);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, "OnOutgoingUploadCompleted", &idx) == AMX_ERR_NONE) {
+                        std::string crcHex = CRC32::toHex(evt.crc32Checksum);
+                        cell strAddr[2];
+                        amx_PushString(amx, &strAddr[1], nullptr, crcHex.c_str(), 0, 0);
+                        amx_PushString(amx, &strAddr[0], nullptr, evt.responseBody.c_str(), 0, 0);
+                        amx_Push(amx, evt.httpStatus);
+                        amx_Push(amx, evt.uploadId);
+                        amx_Exec(amx, nullptr, idx);
+                        amx_Release(amx, strAddr[0]);
+                        amx_Release(amx, strAddr[1]);
+                    }
                 }
                 break;
 
             case OutgoingUploadEvent::Type::Failed:
-                if (amx_FindPublic(amx, "OnOutgoingUploadFailed", &idx) == AMX_ERR_NONE) {
-                    cell strAddr[2];
-                    amx_Push(amx, evt.httpStatus);
-                    amx_PushString(amx, &strAddr[1], nullptr, evt.errorMessage.c_str(), 0, 0);
-                    amx_PushString(amx, &strAddr[0], nullptr, evt.errorType.c_str(), 0, 0);
-                    amx_Push(amx, evt.errorCode);
-                    amx_Push(amx, evt.uploadId);
-                    amx_Exec(amx, nullptr, idx);
-                    amx_Release(amx, strAddr[0]);
-                    amx_Release(amx, strAddr[1]);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, "OnOutgoingUploadFailed", &idx) == AMX_ERR_NONE) {
+                        cell strAddr[2];
+                        amx_Push(amx, evt.httpStatus);
+                        amx_PushString(amx, &strAddr[1], nullptr, evt.errorMessage.c_str(), 0, 0);
+                        amx_PushString(amx, &strAddr[0], nullptr, evt.errorType.c_str(), 0, 0);
+                        amx_Push(amx, evt.errorCode);
+                        amx_Push(amx, evt.uploadId);
+                        amx_Exec(amx, nullptr, idx);
+                        amx_Release(amx, strAddr[0]);
+                        amx_Release(amx, strAddr[1]);
+                    }
                 }
                 break;
         }
@@ -1059,37 +1087,46 @@ static void DrainAllEvents() {
     for (const auto& evt : requestEvents) {
         switch (evt.type) {
             case OutgoingRequestEvent::Type::CompletedText:
-                if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
-                    cell strAddr;
-                    amx_Push(amx, static_cast<cell>(evt.responseBody.size()));
-                    amx_PushString(amx, &strAddr, nullptr, evt.responseBody.c_str(), 0, 0);
-                    amx_Push(amx, evt.httpStatus);
-                    amx_Push(amx, evt.requestId);
-                    amx_Exec(amx, nullptr, idx);
-                    amx_Release(amx, strAddr);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
+                        cell strAddr;
+                        amx_Push(amx, static_cast<cell>(evt.responseBody.size()));
+                        amx_PushString(amx, &strAddr, nullptr, evt.responseBody.c_str(), 0, 0);
+                        amx_Push(amx, evt.httpStatus);
+                        amx_Push(amx, evt.requestId);
+                        amx_Exec(amx, nullptr, idx);
+                        amx_Release(amx, strAddr);
+                    }
                 }
                 break;
 
             case OutgoingRequestEvent::Type::CompletedJson:
-                if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
-                    amx_Push(amx, evt.nodeId);
-                    amx_Push(amx, evt.httpStatus);
-                    amx_Push(amx, evt.requestId);
-                    amx_Exec(amx, nullptr, idx);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
+                        amx_Push(amx, evt.nodeId);
+                        amx_Push(amx, evt.httpStatus);
+                        amx_Push(amx, evt.requestId);
+                        amx_Exec(amx, nullptr, idx);
+                    }
                 }
                 break;
 
             case OutgoingRequestEvent::Type::Failed:
-                if (amx_FindPublic(amx, "OnRequestFailure", &idx) == AMX_ERR_NONE) {
-                    cell strAddr[2];
-                    amx_Push(amx, evt.httpStatus);
-                    amx_PushString(amx, &strAddr[1], nullptr, evt.errorMessage.c_str(), 0, 0);
-                    amx_PushString(amx, &strAddr[0], nullptr, evt.errorType.c_str(), 0, 0);
-                    amx_Push(amx, evt.errorCode);
-                    amx_Push(amx, evt.requestId);
-                    amx_Exec(amx, nullptr, idx);
-                    amx_Release(amx, strAddr[0]);
-                    amx_Release(amx, strAddr[1]);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, "OnRequestFailure", &idx) == AMX_ERR_NONE) {
+                        cell strAddr[2];
+                        amx_Push(amx, evt.httpStatus);
+                        amx_PushString(amx, &strAddr[1], nullptr, evt.errorMessage.c_str(), 0, 0);
+                        amx_PushString(amx, &strAddr[0], nullptr, evt.errorType.c_str(), 0, 0);
+                        amx_Push(amx, evt.errorCode);
+                        amx_Push(amx, evt.requestId);
+                        amx_Exec(amx, nullptr, idx);
+                        amx_Release(amx, strAddr[0]);
+                        amx_Release(amx, strAddr[1]);
+                    }
                 }
                 break;
         }
@@ -1100,35 +1137,44 @@ static void DrainAllEvents() {
     for (const auto& evt : wsEvents) {
         switch (evt.type) {
             case WebSocketEvent::Type::MessageText:
-                if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
-                    cell strAddr;
-                    amx_Push(amx, static_cast<cell>(evt.textPayload.size()));
-                    amx_PushString(amx, &strAddr, nullptr, evt.textPayload.c_str(), 0, 0);
-                    amx_Push(amx, evt.socketId);
-                    amx_Exec(amx, nullptr, idx);
-                    amx_Release(amx, strAddr);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
+                        cell strAddr;
+                        amx_Push(amx, static_cast<cell>(evt.textPayload.size()));
+                        amx_PushString(amx, &strAddr, nullptr, evt.textPayload.c_str(), 0, 0);
+                        amx_Push(amx, evt.socketId);
+                        amx_Exec(amx, nullptr, idx);
+                        amx_Release(amx, strAddr);
+                    }
                 }
                 break;
 
             case WebSocketEvent::Type::MessageJson:
-                if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
-                    amx_Push(amx, evt.jsonNodeId);
-                    amx_Push(amx, evt.socketId);
-                    amx_Exec(amx, nullptr, idx);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, evt.callbackName.c_str(), &idx) == AMX_ERR_NONE) {
+                        amx_Push(amx, evt.jsonNodeId);
+                        amx_Push(amx, evt.socketId);
+                        amx_Exec(amx, nullptr, idx);
+                    }
                 }
                 break;
 
             case WebSocketEvent::Type::Disconnected:
-                if (amx_FindPublic(amx, "OnWebSocketDisconnect", &idx) == AMX_ERR_NONE) {
-                    cell strAddr;
-                    amx_Push(amx, evt.errorCode);
-                    amx_Push(amx, static_cast<cell>(evt.closeReason.size()));
-                    amx_PushString(amx, &strAddr, nullptr, evt.closeReason.c_str(), 0, 0);
-                    amx_Push(amx, evt.closeStatus);
-                    amx_Push(amx, evt.isJson ? 1 : 0);
-                    amx_Push(amx, evt.socketId);
-                    amx_Exec(amx, nullptr, idx);
-                    amx_Release(amx, strAddr);
+                for (AMX* amx : amxList) {
+                    int idx = -1;
+                    if (amx_FindPublic(amx, "OnWebSocketDisconnect", &idx) == AMX_ERR_NONE) {
+                        cell strAddr;
+                        amx_Push(amx, evt.errorCode);
+                        amx_Push(amx, static_cast<cell>(evt.closeReason.size()));
+                        amx_PushString(amx, &strAddr, nullptr, evt.closeReason.c_str(), 0, 0);
+                        amx_Push(amx, evt.closeStatus);
+                        amx_Push(amx, evt.isJson ? 1 : 0);
+                        amx_Push(amx, evt.socketId);
+                        amx_Exec(amx, nullptr, idx);
+                        amx_Release(amx, strAddr);
+                    }
                 }
                 break;
         }
@@ -1146,6 +1192,7 @@ PLUGIN_EXPORT unsigned int PLUGIN_CALL Supports() {
 PLUGIN_EXPORT bool PLUGIN_CALL Load(void** ppData) {
     pAMXFunctions = ppData[PLUGIN_DATA_AMX_EXPORTS];
     logprintf = reinterpret_cast<logprintf_t>(ppData[PLUGIN_DATA_LOGPRINTF]);
+    ImplSetLogger(&PawnRestLogSink);
 
     if (!ImplInitialize()) {
         return false;
