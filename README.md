@@ -1,6 +1,6 @@
-# PawnREST - HTTP File Transfer & REST API Framework
+# PawnREST - HTTP/S File Transfer & REST API Framework
 
-An open.mp server component that provides HTTP file upload/download functionality and a full REST API framework for SA-MP/open.mp servers.
+An plugin that provides HTTP/S file upload/download functionality and a full REST API framework for SA-MP/open.mp servers.
 
 ## Wiki
 
@@ -13,7 +13,7 @@ Examples Pawn scripts are available in [`example/`](./example/):
 - `02_file_routes_and_ops.pwn` - managed file routes and route-backed file operations
 - `03_json_nodes.pwn` - JSON node creation, mutation, and response usage
 - `04_outbound_uploads.pwn` - outbound file uploads with progress callbacks
-- `05_outbound_requests.pwn` - reusable HTTP clients for text and JSON requests
+- `05_outbound_requests.pwn` - reusable HTTP/S clients for text and JSON requests
 - `06_websocket_client.pwn` - text and JSON websocket clients
 - `07_crc_utils.pwn` - CRC32 helpers and file comparison utilities
 - `08_request_input_fallbacks.pwn` - path/query/header/body input fallback patterns
